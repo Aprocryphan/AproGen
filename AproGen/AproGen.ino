@@ -1,6 +1,9 @@
 #include "animation_frames.h"
 #include "arduino_secrets.h"
 #include "remote_website.h"
+#include "logo.h"
+#include <math.h> // For math functions like sin()
+#include <stdlib.h> // For random number generation
 #include <ESPmDNS.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -27,19 +30,55 @@
 #include <Adafruit_SSD1306.h> // For OLED Monitor
 #include <string.h>
 
-#define CORE_0 0
-#define CORE_1 1
-#define STACK_SIZE_1 2048
-#define STACK_SIZE_2 4096
-#define STACK_SIZE_3 8192
-#define STACK_SIZE_4 16384
+// Left Side
+const int SPI_SCK = D13;
+const int IR_SENSOR_PIN = A0;
+const int R1_PIN = A1;
+const int B1_PIN = A2;
+const int R2_PIN = A3;
+//const int B2_PIN = A4;
+//const int A_PIN = A5;
+const int C_PIN = A6;
+const int CLK_PIN = A7;
+
+// Right Side
+const int SPI_CIPO_MISO = D12;
+const int SPI_COPI_MOSI = D11;
+const int SPI_CS_SD = D10;
+const int SPI_CS_VS1053_CHIP = D9;
+const int SPI_CS_VS1053_CMD = D8;
+const int SPI_VS1053_DREQ = D7;
+const int DHT_PIN = D6; // Digital pin connected to the DHT sensor inside the helmet
+const int G1_PIN = D5;
+//const int G2_PIN = D4;
+//const int B_PIN = D3;
+const int D_PIN = D2;
+const int LAT_PIN = D1;
+const int OE_PIN = D0;
+
+/*
+HUB75_I2S_CFG::i2s_pins _pins={R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+HUB75_I2S_CFG mxconfig(
+	64, // Module width
+	32, // Module height
+	2, // chain length
+	_pins, // pin mapping
+);
+dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+*/
+
+const int CORE_0 = 0;
+const int CORE_1 = 1;
+const int STACK_SIZE_1 = 2048;
+const int STACK_SIZE_2 = 4096;
+const int STACK_SIZE_3 = 8192;
+const int STACK_SIZE_4 = 16384;
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-#define DHTPIN D2 // Digital pin connected to the DHT sensor inside the helmet
-#define DHTTYPE DHT11 // The type of DHT sensor
-DHT dht(DHTPIN, DHTTYPE); // Create a DHT object for the sensor
+#define DHT_TYPE DHT11 // The type of DHT sensor
+DHT dht(DHT_PIN, DHT_TYPE); // Create a DHT object for the sensor
 Adafruit_SSD1306 displayLeft(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // Declares the OLED display
 //Adafruit_SSD1306 displayRight(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, OLED_RESET); // Declares the OLED display
 AsyncWebServer WebServer(8080); // Defines the port that the web server is hosted on
@@ -54,6 +93,7 @@ const char* ntpServer = "pool.ntp.org"; // NTP server
 const long gmtOffset_sec = 0;
 const int daylightOffset_sec = 3600;
 
+// -------------------------------------------------
 BLEAdvertising *pAdvertising; // Pointer to the advertising object
 // Example status variables (needs proper sharing mechanism later!)
 volatile uint8_t currentEmotionCode = 0; // 0: Idle, 1: Happy, 2: Blush etc.
@@ -65,8 +105,8 @@ volatile bool proximityDetected = false;
 #define PROTOGEN_ID_1 0x50 // 'P'
 #define PROTOGEN_ID_2 0x52 // 'R'
 
-const int proximitySensor = A0;
-
+const int requestCooldown = 2000;
+unsigned long lastRequestTime = 0;
 int blinkCycles = 0;
 int eyeFrame = 0; // eyeFrame counter for animation
 int mouthFrame = 0; // mouthFrame counter for animation
@@ -157,6 +197,31 @@ void printLocalTime() {
   Serial.println(&timeinfo, "%B %d %Y %H:%M:%S");
 }
 
+void startupIPDisplay() {
+  displayLeft.clearDisplay();
+  displayLeft.setTextSize(1);
+  displayLeft.setCursor(0, 0);
+  displayLeft.print("IP: ");
+  displayLeft.print(localIP);
+  displayLeft.setCursor(0, 8);
+  displayLeft.print("SM: ");
+  displayLeft.print(subnetMask);
+  displayLeft.setCursor(0, 16);
+  displayLeft.print("GW IP: ");
+  displayLeft.print(gatewayIP);
+  displayLeft.display();
+  vTaskDelay(pdMS_TO_TICKS(10000)); // Display for 10 seconds
+  displayLeft.clearDisplay();
+}
+
+// This should be displayed on both
+void displayStartupLogo() {
+  displayLeft.drawBitmap(8, 0, epd_bitmap_AproGenLogo, 32, 32, WHITE); // Draw the logo while setup is running
+  displayLeft.display();
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  displayLeft.clearDisplay();
+}
+
 //TASKS
 
 // Eyes blink twice, while eyes are closed nose gets smaller, on second time mouth animation plays, then all transition out
@@ -208,6 +273,8 @@ void animationLoopDemo(void * parameters) {
     //displayRight.drawBitmap(39, 5, bitmapEyeArray[eyeFrame], 25, 13, WHITE);
     //displayRight.drawBitmap(3, 22, bitmapMouthArray[mouthFrame], 35, 11, WHITE);
     //displayRight.drawBitmap(2, 11, bitmapNoseArray[noseFrame], 10, 6, WHITE);
+    displayLeft.drawFastVLine(65, 0, 33, WHITE); // Temporary
+    displayLeft.drawFastHLine(0, 33, 65, WHITE); // Temporary
     displayLeft.display();
     //displayRight.display();
     vTaskDelay(pdMS_TO_TICKS(66)); // 15 FPS
@@ -376,18 +443,29 @@ void setup() {
   }
   strncpy(localIP, WiFi.localIP().toString().c_str(), sizeof(localIP) - 1);
   localIP[sizeof(localIP) - 1] = '\0'; // Ensure null termination
+  strncpy(subnetMask, WiFi.subnetMask().toString().c_str(), sizeof(subnetMask) - 1);
+  subnetMask[sizeof(subnetMask) - 1] = '\0'; // Ensure null termination
+  strncpy(gatewayIP, WiFi.gatewayIP().toString().c_str(), sizeof(gatewayIP) - 1);
+  gatewayIP[sizeof(gatewayIP) - 1] = '\0'; // Ensure null termination
   sprintf(serialOutputBuffer, "Connected to WiFi.\nIP address: %s", localIP);
   Serial.println(serialOutputBuffer);
   serialOutputBuffer[0] = '\0';
   // initalise web server
   WebServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (millis() - lastRequestTime < requestCooldown) {
+      Serial.println("Request rejected: Cooldown active.");
+      request->send(429, "text/plain", "Error 429 Too Many Requests. Please wait before trying again.");
+      return;
+    }
+    lastRequestTime = millis();
     Serial.println("Root page requested (Stream)");
     AsyncResponseStream *response = request->beginResponseStream("text/html");
     protoRemote(response); // Call function, passing the stream object
     request->send(response); // Send the streamed response
     Serial.println("Streamed response sent");
   });
-  WebServer.begin();
+  WebServer.begin(); // Start website hosting server, port 8080
+  DataServer.begin(); // Start data sending server, port 8081 Replaces serial output
 
   // initialize RTC
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -406,11 +484,11 @@ void setup() {
   }
 
   // initialise Bluetooth
-
-  pinMode(D9, OUTPUT);
-  if (!SD.begin(D9)) {
+  if (!SD.begin(SPI_CS_SD)) { // If the SD card fails to initialize
     Serial.println("SD card failed to initialise");
   }
+
+  // Reset reason
   disableLoopWDT();
   esp_reset_reason_t reason = esp_reset_reason();
   Serial.print("Reset reason: ");
@@ -429,6 +507,9 @@ void setup() {
     default:                 Serial.println("Other"); break;
   }
 
+  displayStartupLogo();
+  startupIPDisplay();
+  
   // Create function tasks and assign to core (MAX 20 Priority)
   xTaskCreatePinnedToCore(animationLoopDemo, "Animation Loop Demo", STACK_SIZE_2, NULL, 2, &animationLoopDemoTask, CORE_1);
   //xTaskCreatePinnedToCore(animationI2SBufferer, "Animation I2S Bufferer", STACK_SIZE_3, NULL, 6, &animationI2SBuffererTask, CORE_0);
